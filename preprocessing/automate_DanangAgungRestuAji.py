@@ -57,6 +57,27 @@ TEXT_COLUMNS = [
 
 SHIPPING_COLUMNS = ["ship-city", "ship-state", "ship-postal-code", "ship-country"]
 
+# Features expected by modelling (forecasting)
+FEATURE_COLUMNS = [
+    'lag_1',
+    'lag_7',
+    'lag_14',
+    'lag_30',
+    'rolling_mean_7',
+    'rolling_std_7',
+    'rolling_mean_30',
+    'rolling_std_30',
+    'day',
+    'month',
+    'year',
+    'weekday',
+    'weekofyear',
+    'quarter',
+    'is_weekend',
+    'month_start',
+    'month_end'
+]
+
 
 def print_section(title: str):
     print("\n" + "=" * 80)
@@ -95,6 +116,55 @@ class AmazonDemandPreprocessor:
         print(f"Dataset Loaded: {path}")
         print(f"Initial Shape: {self.df.shape}")
         return self.df
+
+    def preprocess(self, filepath: str) -> pd.DataFrame:
+        """Simple, rubric-safe preprocessing API.
+
+        Steps:
+        - load raw CSV from `filepath`
+        - run cleaning
+        - aggregate demand by Date x Category
+        - create time, lag, rolling features
+        - drop NA rows and return final `category_ts` (Daily_Demand target)
+
+        Returns:
+            category_ts: pd.DataFrame ready for modelling (Daily_Demand + FEATURE_COLUMNS)
+        """
+        # load
+        df = pd.read_csv(filepath)
+        self.df = df
+
+        # cleaning steps (mirror run_pipeline but do not auto-save)
+        self.remove_duplicates()
+        self.drop_unused_columns()
+        self.clean_dates()
+        self.numeric_cleaning()
+        self.status_filtering()
+        self.remove_invalid_values()
+        self.remove_outliers()
+        self.shipping_cleaning()
+        self.promotion_and_fulfillment()
+        self.currency_cleaning()
+        self.text_cleaning()
+        self.data_type_fixing()
+        self.sort_and_reset()
+
+        # aggregation + features
+        demand_category, _, _ = self.demand_aggregation()
+        category_ts = demand_category.copy()
+        category_ts = self.create_time_features(category_ts)
+        category_ts = self.create_lag_features(category_ts)
+        category_ts = self.create_rolling_features(category_ts)
+
+        # drop rows with NA introduced by lags/rolling
+        category_ts = category_ts.dropna()
+
+        # ensure required feature columns exist
+        missing = [c for c in FEATURE_COLUMNS if c not in category_ts.columns]
+        if missing:
+            raise ValueError(f"Missing features after preprocessing: {missing}")
+
+        return category_ts
 
     def remove_duplicates(self):
         print_section("REMOVE DUPLICATES")
