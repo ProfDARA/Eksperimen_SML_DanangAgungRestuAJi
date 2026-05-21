@@ -10,9 +10,30 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
 import pickle
 import os
+import json
 from typing import Tuple, Dict, Any
 import argparse
 
+
+FEATURE_COLUMNS = [
+    'lag_1',
+    'lag_7',
+    'lag_14',
+    'lag_30',
+    'rolling_mean_7',
+    'rolling_std_7',
+    'rolling_mean_30',
+    'rolling_std_30',
+    'day',
+    'month',
+    'year',
+    'weekday',
+    'weekofyear',
+    'quarter',
+    'is_weekend',
+    'month_start',
+    'month_end'
+]
 
 class AmazonSalePreprocessor:
     """
@@ -35,6 +56,7 @@ class AmazonSalePreprocessor:
         self.scaler = None
         self.label_encoders = {}
         self.feature_names = None
+        self.cleaning_report = None
         
     def load_data(self, filepath: str) -> pd.DataFrame:
         """
@@ -206,6 +228,7 @@ class AmazonSalePreprocessor:
         
         # Load and clean data
         df = self.load_data(filepath)
+        initial_rows = len(df)
         df = self.drop_unnecessary_columns(df)
         df = self.handle_duplicates(df)
         df = self.handle_missing_values(df)
@@ -215,16 +238,42 @@ class AmazonSalePreprocessor:
         # Separate features and target
         X = df.drop(columns=['Status_encoded']) if 'Status_encoded' in df.columns else df
         y = df['Status_encoded'] if 'Status_encoded' in df.columns else None
+
+        # NOTE: Scaling must be done after train/test split to avoid data leakage.
+        # The preprocessor will not fit or apply the scaler here. Modeling pipeline
+        # should perform scaling and then save the fitted scaler for inference.
         
-        # Scale features
-        X = self.scale_numeric_features(X, fit=fit)
-        
+        # Dataset size check (rolling windows and lags reduce usable rows)
+        if len(X) < 100:
+            raise ValueError("Dataset terlalu kecil setelah preprocessing")
+
         print("\n" + "=" * 80)
         print("PREPROCESSING COMPLETED")
         print(f"Features shape: {X.shape}")
         if y is not None:
             print(f"Target shape: {y.shape}")
         print("=" * 80 + "\n")
+
+        # Feature validation (ensure downstream modeling sees the same features)
+        # Only enforce validation when at least one of the expected time-series
+        # feature columns is present (i.e. time-series feature engineering ran).
+        if 'FEATURE_COLUMNS' in globals():
+            expected = set(FEATURE_COLUMNS)
+            present = set(X.columns)
+            # If none of the expected features are present, assume this is a
+            # clean-only run and skip strict validation.
+            if expected & present:
+                missing_features = [col for col in FEATURE_COLUMNS if col not in X.columns]
+                if missing_features:
+                    raise ValueError(f"Missing features: {missing_features}")
+
+        # Prepare cleaning report
+        self.cleaning_report = {
+            "initial_rows": initial_rows,
+            "final_rows": len(X),
+            "removed_rows": initial_rows - len(X),
+            "features_created": len(X.columns)
+        }
         
         return X, y
     
@@ -289,16 +338,22 @@ class AmazonSalePreprocessor:
             directory: Directory to save artifacts
         """
         os.makedirs(directory, exist_ok=True)
-        
-        with open(f'{directory}/scaler.pkl', 'wb') as f:
-            pickle.dump(self.scaler, f)
-        
+        # Save scaler only if it was fitted (modeling pipeline responsibility)
+        if self.scaler is not None:
+            with open(f'{directory}/scaler.pkl', 'wb') as f:
+                pickle.dump(self.scaler, f)
+
         with open(f'{directory}/label_encoders.pkl', 'wb') as f:
             pickle.dump(self.label_encoders, f)
-        
+
         with open(f'{directory}/feature_names.pkl', 'wb') as f:
             pickle.dump(self.feature_names, f)
-        
+
+        # Save cleaning report if present
+        if self.cleaning_report is not None:
+            with open(os.path.join(directory, 'cleaning_report.json'), 'w') as f:
+                json.dump(self.cleaning_report, f, indent=4)
+
         print(f"Artifacts saved to {directory}/")
     
     def load_artifacts(self, directory: str = 'preprocessing_artifacts') -> None:
@@ -348,6 +403,36 @@ def main_preprocessing_pipeline(raw_data_path: str, output_dir: str = 'preproces
     for split_name, (X_split, y_split) in data_splits.items():
         X_split.to_csv(f'{output_dir}/X_{split_name}.csv', index=False)
         y_split.to_csv(f'{output_dir}/y_{split_name}.csv', index=False)
+    
+    # Save cleaned time series dataset for demand forecasting (cleaning only, no scaling)
+    cleaned_path = os.path.join(output_dir, 'daily_demand_forecasting.csv')
+    X.to_csv(cleaned_path, index=False)
+
+    # Save feature metadata for inference
+    feature_metadata = {
+        "feature_columns": FEATURE_COLUMNS,
+        "target_column": "Category_Demand"
+    }
+    with open(os.path.join(output_dir, 'feature_metadata.pkl'), 'wb') as f:
+        pickle.dump(feature_metadata, f)
+
+    # Also copy important artifacts to the repository `preprocessing/` folder for easy access
+    try:
+        repo_root = os.path.normpath(os.path.join(os.path.dirname(__file__), '..'))
+        preprocessing_dir = os.path.join(repo_root, 'preprocessing')
+        os.makedirs(preprocessing_dir, exist_ok=True)
+
+        # copy cleaned csv
+        import shutil
+        shutil.copy(cleaned_path, os.path.join(preprocessing_dir, 'daily_demand_forecasting.csv'))
+
+        # copy metadata and cleaning report if they exist in output_dir
+        shutil.copy(os.path.join(output_dir, 'feature_metadata.pkl'), os.path.join(preprocessing_dir, 'feature_metadata.pkl'))
+        if preprocessor.cleaning_report is not None:
+            shutil.copy(os.path.join(output_dir, 'cleaning_report.json'), os.path.join(preprocessing_dir, 'cleaning_report.json'))
+    except Exception:
+        # non-fatal; copying is convenience only
+        pass
     
     print(f"\nAll preprocessed data saved to {output_dir}/")
     
