@@ -1,467 +1,376 @@
 """
-Automated Data Preprocessing Module for Amazon Sale Report
-Author: Danang Agung Restu Aji
-Purpose: Automate preprocessing steps from Eksperimen_DanangAgungRestuAji.ipynb
+Automated Demand Preprocessing (preprocessing-only)
+Converted from Eksperimen_DanangAgungRestuAji.ipynb
+
+Purpose: provide a reusable, modular preprocessing script that matches
+the notebook steps for demand forecasting (NOT modelling).
+
+Outputs produced:
+- cleaned_amazon_sales.csv
+- daily_demand_forecasting.csv
+- daily_demand_by_state.csv (optional)
+- daily_demand_by_sku.csv (optional)
+
+This module intentionally does NOT perform:
+- scaling
+- train/val/test splitting
+- label encoding of the target
+- saving/loading modelling artifacts
+
+Those belong to a separate modelling pipeline.
 """
 
-import pandas as pd
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import train_test_split
-import pickle
-import os
-import json
-from typing import Tuple, Dict, Any
-import argparse
+import pandas as pd
 
 
-FEATURE_COLUMNS = [
-    'lag_1',
-    'lag_7',
-    'lag_14',
-    'lag_30',
-    'rolling_mean_7',
-    'rolling_std_7',
-    'rolling_mean_30',
-    'rolling_std_30',
-    'day',
-    'month',
-    'year',
-    'weekday',
-    'weekofyear',
-    'quarter',
-    'is_weekend',
-    'month_start',
-    'month_end'
+# =============================================================================
+# CONFIG (match notebook filenames)
+# =============================================================================
+INPUT_FILE = "../amazon_sales_raw/amazon_sale_raw.csv"
+CLEAN_OUTPUT = "cleaned_amazon_sales.csv"
+TS_OUTPUT = "daily_demand_forecasting.csv"
+STATE_OUTPUT = "daily_demand_by_state.csv"
+SKU_OUTPUT = "daily_demand_by_sku.csv"
+
+VALID_STATUS = {"Shipped", "Shipped - Delivered to Buyer"}
+
+TEXT_COLUMNS = [
+    "Status",
+    "Fulfilment",
+    "Sales Channel ",
+    "ship-service-level",
+    "Style",
+    "SKU",
+    "Category",
+    "Size",
+    "ASIN",
+    "Courier Status",
+    "ship-city",
+    "ship-state",
+    "ship-country",
+    "fulfilled-by",
 ]
 
-class AmazonSalePreprocessor:
+SHIPPING_COLUMNS = ["ship-city", "ship-state", "ship-postal-code", "ship-country"]
+
+
+def print_section(title: str):
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+
+
+def safe_strip(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.strip()
+
+
+def remove_outliers_iqr(df: pd.DataFrame, column: str, multiplier: float = 1.5) -> pd.DataFrame:
+    q1 = df[column].quantile(0.25)
+    q3 = df[column].quantile(0.75)
+    iqr = q3 - q1
+    lower = q1 - multiplier * iqr
+    upper = q3 + multiplier * iqr
+    return df[(df[column] >= lower) & (df[column] <= upper)]
+
+
+class AmazonDemandPreprocessor:
+    """Preprocessor that implements the notebook's cleaning and feature engineering
+    for demand forecasting (per category / per state / per SKU).
     """
-    Automated preprocessor for Amazon Sale Report dataset
-    Performs all preprocessing steps: cleaning, encoding, scaling, and splitting
-    """
-    
-    def __init__(self, test_size: float = 0.2, val_size: float = 0.2, random_state: int = 42):
-        """
-        Initialize preprocessor
-        
-        Args:
-            test_size: Proportion of test set
-            val_size: Proportion of validation set from training data
-            random_state: Random seed for reproducibility
-        """
-        self.test_size = test_size
-        self.val_size = val_size
-        self.random_state = random_state
-        self.scaler = None
-        self.label_encoders = {}
-        self.feature_names = None
-        self.cleaning_report = None
-        
-    def load_data(self, filepath: str) -> pd.DataFrame:
-        """
-        Load dataset from CSV
-        
-        Args:
-            filepath: Path to CSV file
-            
-        Returns:
-            Loaded DataFrame
-        """
-        df = pd.read_csv(filepath)
-        print(f"Dataset loaded: {df.shape}")
-        return df
-    
-    def drop_unnecessary_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Remove unnecessary columns
-        
-        Args:
-            df: Input DataFrame
-            
-        Returns:
-            DataFrame with unnecessary columns removed
-        """
-        cols_to_drop = ['index', 'Unnamed: 22', 'Courier Status', 'promotion-ids']
-        df = df.drop(columns=[col for col in cols_to_drop if col in df.columns])
-        print(f"After dropping columns: {df.shape}")
-        return df
-    
-    def handle_duplicates(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Remove duplicate rows
-        
-        Args:
-            df: Input DataFrame
-            
-        Returns:
-            DataFrame with duplicates removed
-        """
-        initial_rows = len(df)
-        df = df.drop_duplicates()
-        removed = initial_rows - len(df)
-        print(f"Removed {removed} duplicate rows. New shape: {df.shape}")
-        return df
-    
-    def handle_missing_values(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Handle missing values in dataset
-        
-        Args:
-            df: Input DataFrame
-            
-        Returns:
-            DataFrame with missing values handled
-        """
-        # Fill numeric missing values
-        if 'ship-postal-code' in df.columns:
-            df['ship-postal-code'] = df['ship-postal-code'].fillna(df['ship-postal-code'].median())
-        
-        if 'B2B' in df.columns:
-            df['B2B'] = df['B2B'].fillna(False)
-        
-        if 'fulfilled-by' in df.columns:
-            df['fulfilled-by'] = df['fulfilled-by'].fillna(df['fulfilled-by'].mode()[0])
-        
-        # Drop rows with critical missing values
-        df = df.dropna(subset=['Amount', 'Status', 'Qty'])
-        
-        print(f"After handling missing values: {df.shape}")
-        return df
-    
-    def extract_date_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Extract features from Date column
-        
-        Args:
-            df: Input DataFrame
-            
-        Returns:
-            DataFrame with new date features
-        """
-        if 'Date' in df.columns:
-            df['Date'] = pd.to_datetime(df['Date'], format='%m-%d-%y', errors='coerce')
-            df['Year'] = df['Date'].dt.year
-            df['Month'] = df['Date'].dt.month
-            df['DayOfWeek'] = df['Date'].dt.dayofweek
-            df.drop(columns=['Date'], inplace=True)
-            print("Date features extracted: Year, Month, DayOfWeek")
-        
-        return df
-    
-    def encode_categorical_features(self, df: pd.DataFrame, fit: bool = True) -> pd.DataFrame:
-        """
-        Encode categorical variables
-        
-        Args:
-            df: Input DataFrame
-            fit: Whether to fit encoders (True for training, False for new data)
-            
-        Returns:
-            DataFrame with encoded features
-        """
-        categorical_features = [
-            'Status', 'Fulfilment', 'Sales Channel', 'ship-service-level',
-            'Category', 'Size', 'ship-state', 'ship-country', 'fulfilled-by'
-        ]
-        
-        for col in categorical_features:
-            if col in df.columns:
-                if fit:
-                    le = LabelEncoder()
-                    df[col + '_encoded'] = le.fit_transform(df[col].astype(str))
-                    self.label_encoders[col] = le
-                else:
-                    if col in self.label_encoders:
-                        df[col + '_encoded'] = self.label_encoders[col].transform(df[col].astype(str))
-                    else:
-                        raise ValueError(f"Encoder for {col} not fitted yet")
-        
-        # Drop original categorical columns
-        df = df.drop(columns=[col for col in categorical_features if col in df.columns])
-        print(f"Categorical features encoded: {len(categorical_features)} features")
-        
-        return df
-    
-    def scale_numeric_features(self, X: pd.DataFrame, fit: bool = True) -> pd.DataFrame:
-        """
-        Normalize numeric features
-        
-        Args:
-            X: Input features DataFrame
-            fit: Whether to fit scaler (True for training, False for new data)
-            
-        Returns:
-            DataFrame with scaled features
-        """
-        numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-        
-        if fit:
-            self.scaler = StandardScaler()
-            X_scaled = X.copy()
-            X_scaled[numeric_cols] = self.scaler.fit_transform(X[numeric_cols])
+
+    def __init__(self, input_path: Optional[str] = None):
+        self.input_path = input_path or INPUT_FILE
+        self.df: Optional[pd.DataFrame] = None
+
+    def load_data(self) -> pd.DataFrame:
+        print_section("LOAD DATA")
+        path = Path(self.input_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Dataset not found: {path.resolve()}")
+        self.df = pd.read_csv(path)
+        print(f"Dataset Loaded: {path}")
+        print(f"Initial Shape: {self.df.shape}")
+        return self.df
+
+    def remove_duplicates(self):
+        print_section("REMOVE DUPLICATES")
+        if self.df is None:
+            raise RuntimeError("Data not loaded")
+        if "Order ID" in self.df.columns:
+            before = len(self.df)
+            self.df = self.df.drop_duplicates(subset=["Order ID"])
+            print(f"Duplicates Removed Using Order ID: {before - len(self.df)}")
         else:
-            if self.scaler is None:
-                raise ValueError("Scaler not fitted yet")
-            X_scaled = X.copy()
-            X_scaled[numeric_cols] = self.scaler.transform(X[numeric_cols])
-        
-        self.feature_names = X_scaled.columns.tolist()
-        print(f"Numeric features scaled: {len(numeric_cols)} features")
-        
-        return X_scaled
-    
-    def preprocess(self, filepath: str, fit: bool = True) -> Tuple[pd.DataFrame, pd.Series]:
-        """
-        Complete preprocessing pipeline
-        
-        Args:
-            filepath: Path to raw data CSV
-            fit: Whether to fit preprocessors (True for training, False for new data)
-            
-        Returns:
-            Tuple of (features, target)
-        """
-        print("\n" + "=" * 80)
-        print("PREPROCESSING PIPELINE STARTED")
-        print("=" * 80 + "\n")
-        
-        # Load and clean data
-        df = self.load_data(filepath)
-        initial_rows = len(df)
-        df = self.drop_unnecessary_columns(df)
-        df = self.handle_duplicates(df)
-        df = self.handle_missing_values(df)
-        df = self.extract_date_features(df)
-        df = self.encode_categorical_features(df, fit=fit)
-        
-        # Separate features and target
-        X = df.drop(columns=['Status_encoded']) if 'Status_encoded' in df.columns else df
-        y = df['Status_encoded'] if 'Status_encoded' in df.columns else None
+            before = len(self.df)
+            self.df = self.df.drop_duplicates()
+            print(f"Duplicates Removed: {before - len(self.df)}")
+        print(f"Shape After Deduplication: {self.df.shape}")
 
-        # NOTE: Scaling must be done after train/test split to avoid data leakage.
-        # The preprocessor will not fit or apply the scaler here. Modeling pipeline
-        # should perform scaling and then save the fitted scaler for inference.
-        
-        # Dataset size check (rolling windows and lags reduce usable rows)
-        if len(X) < 100:
-            raise ValueError("Dataset terlalu kecil setelah preprocessing")
+    def drop_unused_columns(self):
+        print_section("DROP UNUSED COLUMNS")
+        drop_cols = [col for col in self.df.columns if "unnamed" in col.lower()]
+        if drop_cols:
+            self.df = self.df.drop(columns=drop_cols)
+            print(f"Dropped Columns: {drop_cols}")
+        print(f"Remaining Columns: {len(self.df.columns)}")
 
-        print("\n" + "=" * 80)
-        print("PREPROCESSING COMPLETED")
-        print(f"Features shape: {X.shape}")
-        if y is not None:
-            print(f"Target shape: {y.shape}")
-        print("=" * 80 + "\n")
+    def clean_dates(self):
+        print_section("DATE CLEANING")
+        if "Date" not in self.df.columns:
+            raise KeyError("Column 'Date' not found.")
+        self.df["Date"] = pd.to_datetime(self.df["Date"], format="%m-%d-%y", errors="coerce")
+        invalid_dates = self.df["Date"].isnull().sum()
+        print(f"Invalid Dates Removed: {invalid_dates}")
+        self.df = self.df.dropna(subset=["Date"])
 
-        # Feature validation (ensure downstream modeling sees the same features)
-        # Only enforce validation when at least one of the expected time-series
-        # feature columns is present (i.e. time-series feature engineering ran).
-        if 'FEATURE_COLUMNS' in globals():
-            expected = set(FEATURE_COLUMNS)
-            present = set(X.columns)
-            # If none of the expected features are present, assume this is a
-            # clean-only run and skip strict validation.
-            if expected & present:
-                missing_features = [col for col in FEATURE_COLUMNS if col not in X.columns]
-                if missing_features:
-                    raise ValueError(f"Missing features: {missing_features}")
+    def numeric_cleaning(self):
+        print_section("NUMERIC CLEANING")
+        numeric_cols = ["Amount", "Qty"]
+        for col in numeric_cols:
+            if col in self.df.columns:
+                self.df[col] = pd.to_numeric(self.df[col], errors="coerce")
+        print("\nNumeric Null Counts:")
+        print(self.df[[c for c in numeric_cols if c in self.df.columns]].isnull().sum())
 
-        # Prepare cleaning report
-        self.cleaning_report = {
-            "initial_rows": initial_rows,
-            "final_rows": len(X),
-            "removed_rows": initial_rows - len(X),
-            "features_created": len(X.columns)
-        }
-        
-        return X, y
-    
-    def split_data(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, Tuple[pd.DataFrame, pd.Series]]:
-        """
-        Split data into train, validation, and test sets
-        
-        Args:
-            X: Features
-            y: Target
-            
-        Returns:
-            Dictionary with train, val, test splits
-        """
-        # Decide whether stratification is safe: each class must have at least 2 samples
-        stratify_first = None
-        if y is not None:
-            try:
-                min_count = y.value_counts().min()
-                if min_count >= 2:
-                    stratify_first = y
-                else:
-                    print(f"Warning: stratify disabled because least populated class has {min_count} samples")
-            except Exception:
-                stratify_first = None
+    def status_filtering(self):
+        print_section("STATUS FILTERING")
+        if "Status" in self.df.columns:
+            print("\nStatus Distribution Before:")
+            print(self.df["Status"].value_counts(dropna=False))
+            before = len(self.df)
+            self.df = self.df[self.df["Status"].isin(VALID_STATUS)]
+            after = len(self.df)
+            print(f"\nRows Removed By Status Filter: {before - after}")
+            print("\nStatus Distribution After:")
+            print(self.df["Status"].value_counts(dropna=False))
 
-        X_temp, X_test, y_temp, y_test = train_test_split(
-            X, y, test_size=self.test_size, random_state=self.random_state, stratify=stratify_first
+    def remove_invalid_values(self):
+        print_section("REMOVE INVALID VALUES")
+        if "Qty" in self.df.columns:
+            before = len(self.df)
+            self.df = self.df[self.df["Qty"] > 0]
+            print(f"Removed Invalid Qty Rows: {before - len(self.df)}")
+        if "Amount" in self.df.columns:
+            before = len(self.df)
+            self.df = self.df.dropna(subset=["Amount"])
+            self.df = self.df[self.df["Amount"] > 0]
+            print(f"Removed Invalid Amount Rows: {before - len(self.df)}")
+
+    def remove_outliers(self):
+        print_section("REMOVE OUTLIERS")
+        if "Amount" in self.df.columns:
+            before = len(self.df)
+            self.df = remove_outliers_iqr(self.df, "Amount")
+            print(f"Outliers Removed: {before - len(self.df)}")
+
+    def shipping_cleaning(self):
+        print_section("SHIPPING DATA CLEANING")
+        existing_shipping_cols = [col for col in SHIPPING_COLUMNS if col in self.df.columns]
+        if existing_shipping_cols:
+            before = len(self.df)
+            self.df = self.df.dropna(subset=existing_shipping_cols)
+            print(f"Rows Removed Due Missing Shipping Data: {before - len(self.df)}")
+
+    def promotion_and_fulfillment(self):
+        print_section("PROMOTION & FULFILLMENT CLEANING")
+        if "promotion-ids" in self.df.columns:
+            self.df["has_promo"] = self.df["promotion-ids"].notnull().astype(int)
+            self.df["promotion-ids"] = self.df["promotion-ids"].fillna("No Promotion")
+        else:
+            self.df["has_promo"] = 0
+            self.df["promotion-ids"] = "No Promotion"
+
+        if "fulfilled-by" in self.df.columns:
+            self.df["fulfilled-by"] = self.df["fulfilled-by"].fillna("Merchant")
+        if "Courier Status" in self.df.columns:
+            self.df["Courier Status"] = self.df["Courier Status"].fillna("Unknown")
+
+    def currency_cleaning(self):
+        print_section("CURRENCY CLEANING")
+        if "currency" in self.df.columns:
+            print("\nCurrency Distribution:")
+            print(self.df["currency"].value_counts(dropna=False))
+            self.df["currency"] = self.df["currency"].fillna("INR")
+            if self.df["currency"].nunique() > 1:
+                print("\n[WARNING] Multiple currencies detected. Filtering to INR rows.")
+                before = len(self.df)
+                self.df = self.df[self.df["currency"] == "INR"]
+                print(f"Removed Non-INR Rows: {before - len(self.df)}")
+
+    def text_cleaning(self):
+        print_section("TEXT CLEANING")
+        for col in TEXT_COLUMNS:
+            if col in self.df.columns:
+                self.df[col] = safe_strip(self.df[col])
+        print("Text Cleaning Completed.")
+
+    def data_type_fixing(self):
+        print_section("DATA TYPE FIXING")
+        if "Qty" in self.df.columns:
+            # safe cast: fillna then astype int
+            self.df["Qty"] = pd.to_numeric(self.df["Qty"], errors="coerce").fillna(0).astype(int)
+        if "ship-postal-code" in self.df.columns:
+            self.df["ship-postal-code"] = self.df["ship-postal-code"].astype(str).str.strip()
+        if "B2B" in self.df.columns:
+            self.df["B2B"] = self.df["B2B"].astype(bool).astype(int)
+        print(self.df.dtypes)
+
+    def sort_and_reset(self):
+        print_section("SORTING")
+        self.df = self.df.sort_values(by="Date")
+        self.df = self.df.reset_index(drop=True)
+        print("Data Sorted By Date.")
+
+    def demand_aggregation(self):
+        print_section("DEMAND AGGREGATION")
+        if "Qty" not in self.df.columns:
+            raise KeyError("Column 'Qty' not found for demand aggregation.")
+        required_cols = {"Date", "Category"}
+        if not required_cols.issubset(self.df.columns):
+            raise KeyError("Columns 'Date' and 'Category' are required for demand per category.")
+
+        demand_category = (
+            self.df.groupby(["Date", "Category"]) ["Qty"]
+            .sum()
+            .reset_index()
         )
+        demand_category = demand_category.rename(columns={"Qty": "Daily_Demand"})
 
-        # For second split (train/val) decide stratify based on y_temp
-        stratify_second = None
-        if y_temp is not None:
-            try:
-                min_count_temp = y_temp.value_counts().min()
-                if min_count_temp >= 2:
-                    stratify_second = y_temp
-                else:
-                    print(f"Warning: validation stratify disabled because least populated class in temp split has {min_count_temp} samples")
-            except Exception:
-                stratify_second = None
+        demand_state = None
+        if "ship-state" in self.df.columns:
+            demand_state = (
+                self.df.groupby(["Date", "ship-state"]) ["Qty"]
+                .sum()
+                .reset_index()
+            )
+            demand_state = demand_state.rename(columns={"Qty": "Daily_Demand"})
 
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_temp, y_temp, test_size=self.val_size, random_state=self.random_state, stratify=stratify_second
+        demand_sku = None
+        if "SKU" in self.df.columns:
+            demand_sku = (
+                self.df.groupby(["Date", "SKU"]) ["Qty"]
+                .sum()
+                .reset_index()
+            )
+            demand_sku = demand_sku.rename(columns={"Qty": "Daily_Demand"})
+
+        return demand_category, demand_state, demand_sku
+
+    def create_time_features(self, category_ts: pd.DataFrame) -> pd.DataFrame:
+        category_ts["day"] = category_ts["Date"].dt.day
+        category_ts["month"] = category_ts["Date"].dt.month
+        category_ts["year"] = category_ts["Date"].dt.year
+        category_ts["weekday"] = category_ts["Date"].dt.weekday
+        category_ts["weekofyear"] = (
+            category_ts["Date"].dt.isocalendar().week.astype(int)
         )
-        
-        print(f"Train set: {X_train.shape}")
-        print(f"Validation set: {X_val.shape}")
-        print(f"Test set: {X_test.shape}")
-        
-        return {
-            'train': (X_train, y_train),
-            'val': (X_val, y_val),
-            'test': (X_test, y_test)
-        }
-    
-    def save_artifacts(self, directory: str = 'preprocessing_artifacts') -> None:
-        """
-        Save preprocessor artifacts (scaler and encoders)
-        
-        Args:
-            directory: Directory to save artifacts
-        """
-        os.makedirs(directory, exist_ok=True)
-        # Save scaler only if it was fitted (modeling pipeline responsibility)
-        if self.scaler is not None:
-            with open(f'{directory}/scaler.pkl', 'wb') as f:
-                pickle.dump(self.scaler, f)
+        category_ts["quarter"] = category_ts["Date"].dt.quarter
+        category_ts["is_weekend"] = (category_ts["weekday"] >= 5).astype(int)
+        category_ts["month_start"] = category_ts["Date"].dt.is_month_start.astype(int)
+        category_ts["month_end"] = category_ts["Date"].dt.is_month_end.astype(int)
+        return category_ts
 
-        with open(f'{directory}/label_encoders.pkl', 'wb') as f:
-            pickle.dump(self.label_encoders, f)
+    def create_lag_features(self, category_ts: pd.DataFrame) -> pd.DataFrame:
+        category_ts = category_ts.sort_values(["Category", "Date"])
+        category_ts["lag_1"] = category_ts.groupby("Category")["Daily_Demand"].shift(1)
+        category_ts["lag_7"] = category_ts.groupby("Category")["Daily_Demand"].shift(7)
+        category_ts["lag_14"] = category_ts.groupby("Category")["Daily_Demand"].shift(14)
+        category_ts["lag_30"] = category_ts.groupby("Category")["Daily_Demand"].shift(30)
+        return category_ts
 
-        with open(f'{directory}/feature_names.pkl', 'wb') as f:
-            pickle.dump(self.feature_names, f)
+    def create_rolling_features(self, category_ts: pd.DataFrame) -> pd.DataFrame:
+        category_ts["rolling_mean_7"] = (
+            category_ts.groupby("Category")["Daily_Demand"].shift(1).rolling(window=7).mean()
+        )
+        category_ts["rolling_std_7"] = (
+            category_ts.groupby("Category")["Daily_Demand"].shift(1).rolling(window=7).std()
+        )
+        category_ts["rolling_mean_30"] = (
+            category_ts.groupby("Category")["Daily_Demand"].shift(1).rolling(window=30).mean()
+        )
+        category_ts["rolling_std_30"] = (
+            category_ts.groupby("Category")["Daily_Demand"].shift(1).rolling(window=30).std()
+        )
+        return category_ts
 
-        # Save cleaning report if present
-        if self.cleaning_report is not None:
-            with open(os.path.join(directory, 'cleaning_report.json'), 'w') as f:
-                json.dump(self.cleaning_report, f, indent=4)
+    def drop_nulls_after_fe(self, category_ts: pd.DataFrame) -> pd.DataFrame:
+        print_section("REMOVE NULLS AFTER FEATURE ENGINEERING")
+        before = len(category_ts)
+        category_ts = category_ts.dropna()
+        after = len(category_ts)
+        print(f"Rows Removed: {before - after}")
+        print(f"Final Time Series Shape: {category_ts.shape}")
+        return category_ts
 
-        print(f"Artifacts saved to {directory}/")
-    
-    def load_artifacts(self, directory: str = 'preprocessing_artifacts') -> None:
-        """
-        Load preprocessor artifacts
-        
-        Args:
-            directory: Directory containing artifacts
-        """
-        with open(f'{directory}/scaler.pkl', 'rb') as f:
-            self.scaler = pickle.load(f)
-        
-        with open(f'{directory}/label_encoders.pkl', 'rb') as f:
-            self.label_encoders = pickle.load(f)
-        
-        with open(f'{directory}/feature_names.pkl', 'rb') as f:
-            self.feature_names = pickle.load(f)
-        
-        print(f"Artifacts loaded from {directory}/")
+    def save_outputs(self, cleaned: pd.DataFrame, category_ts: pd.DataFrame, demand_state: Optional[pd.DataFrame], demand_sku: Optional[pd.DataFrame], output_dir: str = '.'):
+        print_section("SAVE OUTPUT")
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
+        cleaned.to_csv(out_dir / CLEAN_OUTPUT, index=False)
+        category_ts.to_csv(out_dir / TS_OUTPUT, index=False)
+        if demand_state is not None:
+            demand_state.to_csv(out_dir / STATE_OUTPUT, index=False)
+        if demand_sku is not None:
+            demand_sku.to_csv(out_dir / SKU_OUTPUT, index=False)
 
-def main_preprocessing_pipeline(raw_data_path: str, output_dir: str = 'preprocessing_artifacts') -> Dict[str, Any]:
-    """
-    Main function to run complete preprocessing pipeline
-    
-    Args:
-        raw_data_path: Path to raw CSV data
-        output_dir: Directory to save preprocessed data and artifacts
-        
-    Returns:
-        Dictionary with preprocessed datasets and preprocessor object
-    """
-    # Initialize preprocessor
-    preprocessor = AmazonSalePreprocessor(test_size=0.2, val_size=0.2, random_state=42)
-    
-    # Run preprocessing
-    X, y = preprocessor.preprocess(raw_data_path, fit=True)
-    
-    # Split data
-    data_splits = preprocessor.split_data(X, y)
-    
-    # Save artifacts
-    preprocessor.save_artifacts(output_dir)
-    
-    # Save preprocessed datasets
-    os.makedirs(output_dir, exist_ok=True)
-    for split_name, (X_split, y_split) in data_splits.items():
-        X_split.to_csv(f'{output_dir}/X_{split_name}.csv', index=False)
-        y_split.to_csv(f'{output_dir}/y_{split_name}.csv', index=False)
-    
-    # Save cleaned time series dataset for demand forecasting (cleaning only, no scaling)
-    cleaned_path = os.path.join(output_dir, 'daily_demand_forecasting.csv')
-    X.to_csv(cleaned_path, index=False)
+        print(f"Saved Clean Dataset → {out_dir / CLEAN_OUTPUT}")
+        print(f"Saved Demand (Category) Dataset → {out_dir / TS_OUTPUT}")
+        if demand_state is not None:
+            print(f"Saved Demand (State) Dataset → {out_dir / STATE_OUTPUT}")
+        if demand_sku is not None:
+            print(f"Saved Demand (SKU) Dataset → {out_dir / SKU_OUTPUT}")
 
-    # Save feature metadata for inference
-    feature_metadata = {
-        "feature_columns": FEATURE_COLUMNS,
-        "target_column": "Category_Demand"
-    }
-    with open(os.path.join(output_dir, 'feature_metadata.pkl'), 'wb') as f:
-        pickle.dump(feature_metadata, f)
+    def run_pipeline(self, output_dir: str = '.') -> None:
+        # Execute steps mirroring the notebook
+        self.load_data()
+        self.remove_duplicates()
+        self.drop_unused_columns()
+        self.clean_dates()
+        self.numeric_cleaning()
+        self.status_filtering()
+        self.remove_invalid_values()
+        self.remove_outliers()
+        self.shipping_cleaning()
+        self.promotion_and_fulfillment()
+        self.currency_cleaning()
+        self.text_cleaning()
+        self.data_type_fixing()
+        self.sort_and_reset()
 
-    # Also copy important artifacts to the repository `preprocessing/` folder for easy access
-    try:
-        repo_root = os.path.normpath(os.path.join(os.path.dirname(__file__), '..'))
-        preprocessing_dir = os.path.join(repo_root, 'preprocessing')
-        os.makedirs(preprocessing_dir, exist_ok=True)
+        print_section("FINAL CLEANED DATA OVERVIEW")
+        print(f"\nFinal Shape: {self.df.shape}")
+        print("\nMissing Values:")
+        print(self.df.isnull().sum())
+        print("\nData Types:")
+        print(self.df.dtypes)
 
-        # copy cleaned csv
-        import shutil
-        shutil.copy(cleaned_path, os.path.join(preprocessing_dir, 'daily_demand_forecasting.csv'))
+        # Aggregation and feature engineering
+        demand_category, demand_state, demand_sku = self.demand_aggregation()
 
-        # copy metadata and cleaning report if they exist in output_dir
-        shutil.copy(os.path.join(output_dir, 'feature_metadata.pkl'), os.path.join(preprocessing_dir, 'feature_metadata.pkl'))
-        if preprocessor.cleaning_report is not None:
-            shutil.copy(os.path.join(output_dir, 'cleaning_report.json'), os.path.join(preprocessing_dir, 'cleaning_report.json'))
-    except Exception:
-        # non-fatal; copying is convenience only
-        pass
-    
-    print(f"\nAll preprocessed data saved to {output_dir}/")
-    
-    return {
-        'preprocessor': preprocessor,
-        'data_splits': data_splits,
-        'X': X,
-        'y': y
-    }
+        print_section("TIME FEATURE ENGINEERING")
+        category_ts = demand_category.copy()
+        category_ts = self.create_time_features(category_ts)
+
+        print_section("LAG FEATURE ENGINEERING")
+        category_ts = self.create_lag_features(category_ts)
+
+        print_section("ROLLING FEATURE ENGINEERING")
+        category_ts = self.create_rolling_features(category_ts)
+
+        category_ts = self.drop_nulls_after_fe(category_ts)
+
+        print_section("FINAL TIME SERIES DATASET")
+        print(category_ts.head())
+
+        # Save outputs
+        self.save_outputs(self.df, category_ts, demand_state, demand_sku, output_dir=output_dir)
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Run preprocessing pipeline')
-    parser.add_argument('-r', '--raw', default=None,
-                        help='Path to raw CSV file (absolute or repo-relative). If omitted, script will try to locate the file relative to this script.')
-    parser.add_argument('-o', '--output', default='preprocessing_artifacts',
-                        help='Output directory to save artifacts')
-    args = parser.parse_args()
-
-    # Resolve raw data path: prefer provided arg, otherwise derive path relative to this script
-    if args.raw:
-        raw_data_path = args.raw
-    else:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        # expected location: ../amazon_sales_raw/amazon_sale_raw.csv relative to preprocessing script
-        raw_data_path = os.path.normpath(os.path.join(script_dir, '..', 'amazon_sales_raw', 'amazon_sale_raw.csv'))
-
-    if not os.path.exists(raw_data_path):
-        raise FileNotFoundError(f"Raw data file not found at resolved path: {raw_data_path}")
-
-    result = main_preprocessing_pipeline(raw_data_path, output_dir=args.output)
-    print('\nPreprocessing complete! Ready for model training.')
+if __name__ == "__main__":
+    pre = AmazonDemandPreprocessor()
+    pre.run_pipeline(output_dir='.')
