@@ -20,6 +20,7 @@ This module intentionally does NOT perform:
 Those belong to a separate modelling pipeline.
 """
 
+import argparse
 from pathlib import Path
 from typing import Optional
 
@@ -30,7 +31,8 @@ import pandas as pd
 # =============================================================================
 # CONFIG (match notebook filenames)
 # =============================================================================
-INPUT_FILE = "../amazon_sales_raw/amazon_sale_raw.csv"
+SCRIPT_DIR = Path(__file__).resolve().parent
+INPUT_FILE = SCRIPT_DIR.parent / "amazon_sales_raw" / "amazon_sale_raw.csv"
 CLEAN_OUTPUT = "cleaned_amazon_sales.csv"
 TS_OUTPUT = "daily_demand_forecasting.csv"
 STATE_OUTPUT = "daily_demand_by_state.csv"
@@ -442,5 +444,20 @@ class AmazonDemandPreprocessor:
 
 
 if __name__ == "__main__":
-    pre = AmazonDemandPreprocessor()
-    pre.run_pipeline(output_dir='.')
+    parser = argparse.ArgumentParser(description="Run the Amazon sales preprocessing pipeline.")
+    parser.add_argument(
+        "-i",
+        "--input-file",
+        default=str(INPUT_FILE),
+        help="Path to the raw Amazon sales CSV.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        default=str(SCRIPT_DIR),
+        help="Directory where preprocessing outputs will be written.",
+    )
+    args = parser.parse_args()
+
+    pre = AmazonDemandPreprocessor(input_path=args.input_file)
+    pre.run_pipeline(output_dir=args.output_dir)

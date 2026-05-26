@@ -1,0 +1,53 @@
+name: Preprocess Data
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  preprocess:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run preprocessing script
+        run: |
+          python preprocessing/automate_DanangAgungRestuAji.py -o preprocessing/amazon_sales_preprocessing
+
+      - name: List outputs
+        run: |
+          echo "Contents of preprocessing folder:"
+          ls -R preprocessing || true
+
+      - name: Commit processed outputs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add preprocessing/amazon_sales_preprocessing || true
+          git commit -m "chore: update processed data from workflow" || echo "No changes to commit"
+          git push || echo "Push failed or no new commits"
+
+      - name: Upload processed-data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-data
+          path: |
+            preprocessing/amazon_sales_preprocessing

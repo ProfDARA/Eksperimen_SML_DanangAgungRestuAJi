@@ -30,7 +30,7 @@ jobs:
 
       - name: Run preprocessing script
         run: |
-          python preprocessing/automate_DanangAgungRestuAji.py -o preprocessing/preprocessing_artifacts_run
+          python preprocessing/automate_DanangAgungRestuAji.py -o preprocessing/amazon_sales_preprocessing
 
       - name: List outputs
         run: |
@@ -41,7 +41,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add preprocessing/preprocessing_artifacts_run || true
+          git add preprocessing/amazon_sales_preprocessing || true
           git commit -m "chore: update processed data from workflow" || echo "No changes to commit"
           git push || echo "Push failed or no new commits"
 
@@ -50,4 +50,4 @@ jobs:
         with:
           name: processed-data
           path: |
-            preprocessing/preprocessing_artifacts_run
+            preprocessing/amazon_sales_preprocessing
